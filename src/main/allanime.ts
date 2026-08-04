@@ -1,13 +1,14 @@
 import axios from 'axios'
-import crypto from 'crypto'
 
-const ALLANIME_API = 'https://api.allanime.day/api'
-const ALLANIME_BASE = 'https://allanime.day'
+// AllAnime's API now requires a per-request encrypted "aaReq" token derived from
+// a key that's scraped off their homepage, and that scraping scheme has already
+// broken multiple times this year. ani-cli itself dropped AllAnime for anidb.app
+// on 2026-08-01, so we do the same here instead of chasing a moving target.
+const ANIDB_BASE = 'https://anidb.app'
 const AGENT =
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
-const REFR = 'https://youtu-chan.com'
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0'
 
-const DECRYPT_KEY = crypto.createHash('sha256').update('Xot36i3lK3:v1').digest()
+const headers = { 'User-Agent': AGENT }
 
 export interface PlayableSource {
   provider: string
@@ -17,31 +18,109 @@ export interface PlayableSource {
   referrer?: string
 }
 
-function decryptAES(ciphertextB64: string): string {
+interface AnidbEpisode {
+  id: number
+  number: number
+}
+
+interface AnidbCard {
+  _id: string
+  numericId: string
+  name: string
+  thumbnail: string
+  score: number
+}
+
+function decodeEntities(str: string): string {
+  return str.replace(/&#039;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+}
+
+function numericIdFromSlug(slug: string): string {
+  const match = slug.match(/-(\d+)$/)
+  return match ? match[1] : slug
+}
+
+async function getEpisodes(numericId: string): Promise<AnidbEpisode[]> {
   try {
-    const buffer = Buffer.from(ciphertextB64, 'base64')
-    const extractedIv = buffer.subarray(1, 13)
-    const ivHex = extractedIv.toString('hex') + '00000002'
-    const iv = Buffer.from(ivHex, 'hex')
-    const ciphertext = buffer.subarray(13, buffer.length - 16)
-    const decipher = crypto.createDecipheriv('aes-256-ctr', DECRYPT_KEY, iv)
-    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()])
-    return decrypted.toString('utf8')
+    const res = await axios.get(`${ANIDB_BASE}/api/frontend/anime/${numericId}/episodes`, {
+      headers
+    })
+    return res.data?.episodes || []
   } catch (e) {
-    console.error('AES Decryption failed:', e)
-    return ''
+    return []
   }
 }
 
-function decodeXorUrl(hexUrl: string): string {
-  if (!hexUrl.startsWith('--')) return hexUrl
-  const hexStr = hexUrl.slice(2)
-  let decoded = ''
-  for (let i = 0; i < hexStr.length; i += 2) {
-    const hexChar = hexStr.slice(i, i + 2)
-    decoded += String.fromCharCode(parseInt(hexChar, 16) ^ 56)
+function parseSearchCards(html: string): AnidbCard[] {
+  const chunks = html.split('<a href="https://anidb.app/anime/').slice(1)
+
+  const cards: AnidbCard[] = []
+  for (const chunk of chunks) {
+    const endIdx = chunk.indexOf('</a>')
+    const cardHtml = endIdx >= 0 ? chunk.slice(0, endIdx) : chunk
+
+    const idMatch = cardHtml.match(/^([a-z0-9-]+-(\d+))"/)
+    const titleMatch = cardHtml.match(/title="([^"]*)"/)
+    const imgMatch = cardHtml.match(/<img src="([^"]*)"/)
+    const scoreMatch = cardHtml.match(/<\/svg>\s*([\d.]+)\s*<\/span>/)
+
+    if (!idMatch || !titleMatch) continue
+
+    cards.push({
+      _id: idMatch[1],
+      numericId: idMatch[2],
+      name: decodeEntities(titleMatch[1]),
+      thumbnail: imgMatch ? imgMatch[1] : '',
+      score: scoreMatch ? parseFloat(scoreMatch[1]) : 0
+    })
   }
-  return decoded.replace(/\/clock$/, '/clock.json')
+
+  return cards
+}
+
+export async function searchAnime(query: string) {
+  try {
+    const res = await axios.get(`${ANIDB_BASE}/browse`, {
+      params: { q: query },
+      headers
+    })
+
+    const cards = parseSearchCards(res.data).slice(0, 20)
+
+    return await Promise.all(
+      cards.map(async (card) => {
+        const episodes = await getEpisodes(card.numericId)
+        const episodeCount = episodes.length
+        const lastEpisode = episodeCount ? episodes[episodeCount - 1].number : 0
+
+        return {
+          _id: card._id,
+          name: card.name,
+          thumbnail: card.thumbnail,
+          score: card.score,
+          episodeCount,
+          availableEpisodes: { sub: episodeCount },
+          lastEpisodeInfo: { sub: { episodeString: String(lastEpisode) } }
+        }
+      })
+    )
+  } catch (e) {
+    console.error('could not do query search: ', e)
+    return []
+  }
+}
+
+export async function getEpisodesList(showId: string) {
+  try {
+    const episodes = await getEpisodes(numericIdFromSlug(showId))
+    return episodes
+      .map((e) => e.number)
+      .sort((a, b) => a - b)
+      .map(String)
+  } catch (e) {
+    console.error('could not fetch episodes: ', e)
+    return []
+  }
 }
 
 export async function getEpisodeData(
@@ -51,223 +130,49 @@ export async function getEpisodeData(
 ): Promise<PlayableSource[]> {
   logger!(`getting sources for ${showId}, episode ${episodeString}...`)
 
-  const epStr = String(episodeString)
-  const query_vars = JSON.stringify({ showId, translationType: 'sub', episodeString: epStr })
+  const targetEpisode = Number(episodeString)
+  const episodes = await getEpisodes(numericIdFromSlug(showId))
+  const episode = episodes.find((e) => e.number === targetEpisode)
 
-  const query_hash = 'd405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec'
-  const query_ext = JSON.stringify({ persistedQuery: { version: 1, sha256Hash: query_hash } })
-
-  const headers = {
-    'User-Agent': AGENT,
-    Referer: REFR,
-    Origin: REFR
+  if (!episode) {
+    logger!(`episode ${episodeString} not found for ${showId}`)
+    return []
   }
 
-  let responseData: any = null
+  logger!(`resolving stream for episode id ${episode.id}...`)
 
-  logger!(`trying GET request (presisted query)`)
   try {
-    const apqUrl = `${ALLANIME_API}/api?variables=${encodeURIComponent(query_vars)}&extensions=${encodeURIComponent(query_ext)}`
-    const getResp = await axios.get(apqUrl, { headers })
-    responseData = getResp.data
-  } catch (e) {}
+    const langRes = await axios.get(`${ANIDB_BASE}/api/frontend/episode/${episode.id}/languages`, {
+      headers
+    })
+    const languages: { code: string; embed_url: string }[] = langRes.data?.languages || []
+    const lang = languages.find((l) => l.code === 'jpn') || languages[0]
 
-  logger!(`fallback on POST request`)
-  if (!responseData || !JSON.stringify(responseData).includes('tobeparsed')) {
-    try {
-      const fallbackQuery =
-        'query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode( showId: $showId translationType: $translationType episodeString: $episodeString ) { episodeString sourceUrls }}'
-      const postResp = await axios.post(
-        `${ALLANIME_API}/api`,
-        {
-          variables: { showId, translationType: 'sub', episodeString: epStr },
-          query: fallbackQuery
-        },
-        { headers }
-      )
-      responseData = postResp.data
-    } catch (e) {
-      logger!(`both get and post failed, plz tell me and also screenshot the logs`)
+    if (!lang?.embed_url) {
+      logger!(`no embed url found`)
       return []
     }
-  }
 
-  let targetPayload =
-    responseData?.data?.tobeparsed ||
-    responseData?.data?.episode?.sourceUrls ||
-    responseData?.tobeparsed
-  let sources: any[] = []
+    const embedRes = await axios.get(lang.embed_url, { headers })
+    const match = String(embedRes.data).match(/file:\s*'([^']+)'/)
 
-  if (Array.isArray(targetPayload)) {
-    sources = targetPayload
-  } else if (typeof targetPayload === 'string') {
-    const decrypted = decryptAES(targetPayload)
-    try {
-      // strip null bytes that might survive the decryption
-      const cleanStr = decrypted.replace(/\0/g, '')
-      const parsed = JSON.parse(cleanStr)
-      sources =
-        parsed.episode?.sourceUrls || parsed.data?.episode?.sourceUrls || parsed.sourceUrls || []
-    } catch (e) {
-      logger!(`failed parsing target payload, probably also screenshot and send to me`)
+    if (!match) {
+      logger!(`could not extract stream url from embed page`)
       return []
     }
-  }
 
-  logger!(`got ${sources.length} sources`)
+    logger!(`got source`)
 
-  const playableSources: PlayableSource[] = []
-
-  for (const source of sources) {
-    logger!(`checking ${source.sourceUrl}`)
-    if (!source.sourceUrl) continue
-
-    let sourceName = source.sourceName || 'Unknown'
-    let finalUrl = source.sourceUrl
-
-    if (finalUrl.startsWith('--')) {
-      finalUrl = decodeXorUrl(finalUrl)
-    } else if (finalUrl.includes('tobeparsed=')) {
-      finalUrl = decryptAES(finalUrl.split('tobeparsed=')[1])
-    }
-
-    if (!finalUrl) continue
-
-    //need to do html scraping
-    if (finalUrl.includes('mp4upload')) {
-      try {
-        const embedResponse = await axios.get(finalUrl, {
-          headers: { 'User-Agent': AGENT, Referer: REFR }
-        })
-
-        //src: "https://.../video.mp4"
-        const srcMatch = embedResponse.data.match(/src:\s*["']([^"']+)["']/)
-
-        if (srcMatch && srcMatch[1]) {
-          playableSources.push({
-            provider: sourceName,
-            quality: 'Direct/MP4',
-            sourceUrl: srcMatch[1],
-            isM3U8: srcMatch[1].includes('.m3u8'),
-            referrer: 'https://www.mp4upload.com'
-          })
-        }
-      } catch (err) {
-        logger!(`failed to scrape mp4upload`)
+    return [
+      {
+        provider: 'AniDB',
+        quality: 'Auto',
+        sourceUrl: match[1],
+        isM3U8: true
       }
-      continue
-    }
-
-    // i will need to implement yt dlb or let mpv do it
-    if (finalUrl.includes('tools.fast4speed.rsvp') || finalUrl.includes('youtube.com')) {
-      playableSources.push({
-        provider: sourceName,
-        quality: 'Adaptive/Stream',
-        sourceUrl: finalUrl,
-        isM3U8: finalUrl.includes('.m3u8'),
-        referrer: REFR
-      })
-      continue
-    }
-
-    try {
-      const fullUrl = finalUrl.startsWith('http') ? finalUrl : `https://${ALLANIME_BASE}${finalUrl}`
-      const linkResponse = await axios.get(fullUrl, { headers })
-      const linksArray =
-        linkResponse.data?.links || (Array.isArray(linkResponse.data) ? linkResponse.data : null)
-
-      if (linksArray) {
-        for (const stream of linksArray) {
-          const isSharepoint = sourceName.toLowerCase().includes('sharepoint')
-
-          playableSources.push({
-            provider: sourceName,
-            quality: stream.resolutionStr || 'Auto',
-            sourceUrl: stream.link,
-            isM3U8: stream.link.includes('.m3u8') || !!stream.hls,
-            referrer: isSharepoint ? undefined : REFR
-          })
-        }
-      }
-    } catch (err: any) {
-      logger!(`failed parsing stream for ${sourceName}`)
-    }
-  }
-
-  return playableSources
-}
-
-export async function getEpisodesList(showId: string) {
-  const query = `
-        query ($showId: String!) {
-            show(_id: $showId) {
-                availableEpisodesDetail
-            }
-        }
-    `
-
-  const payload = {
-    variables: {
-      showId: showId
-    },
-    query: query
-  }
-
-  const headers = {
-    'Content-Type': 'application/json',
-    Referer: 'https://allmanga.to/',
-    'User-Agent': AGENT
-  }
-
-  try {
-    const response = await axios.post('https://api.allanime.day/api', payload, { headers })
-
-    const data = response.data?.data?.show?.availableEpisodesDetail
-
-    if (!data) {
-      console.error('No episode data found for showId:', showId)
-      return null
-    }
-
-    return data.sub
+    ]
   } catch (e) {
-    console.error('could not fetch episodes: ', e)
-    return null
-  }
-}
-
-export async function searchAnime(query: string) {
-  const payload = {
-    variables: {
-      search: {
-        // allowUnknown: false,
-        // allowAdult: false,
-        query: query
-      },
-      limit: 20,
-      page: 1,
-      translationType: 'sub',
-      countryOrigin: 'ALL'
-    },
-    extensions: {
-      persistedQuery: {
-        version: 1,
-        sha256Hash: 'a24c500a1b765c68ae1d8dd85174931f661c71369c89b92b88b75a725afc471c'
-      }
-    }
-  }
-
-  const headers = {
-    'Content-Type': 'application/json',
-    Referer: 'https://allmanga.to/',
-    // "Origin": "https://allmanga.to",
-    'User-Agent': AGENT
-  }
-
-  try {
-    const response = await axios.post('https://api.allanime.day/api', payload, { headers })
-    return response.data.data.shows.edges
-  } catch (e) {
-    console.error('could not do query search: ', e)
+    logger!(`failed fetching stream, plz tell me and also screenshot the logs`)
+    return []
   }
 }

@@ -45,7 +45,7 @@ export function EpisodeSelector() {
     if (animeId) {
       async function a() {
         const data = await window.api.api_getAnimeEpisodeList(animeId!)
-        setAnimeEpisodes([...data].reverse())
+        setAnimeEpisodes(data)
       }
       a()
     }
