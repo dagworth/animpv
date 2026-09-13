@@ -5,10 +5,10 @@ import styles from './AnimeBox.module.css'
 export function AnimeBox({ anime }) {
   const [imgSrc, setImgSrc] = useState(anime.thumbnail)
   const { setPage, setAnimeId, setAnimeName, setAnimeEnded, setAnimeMaxEps, setAnimeImage } = useContext(context)
-  const isMovie = anime.availableEpisodes.sub == 1 && anime.episodeCount == 1;
+  const isMovie = anime.type === 'MOVIE'
 
   useEffect(() => {
-    if (anime.thumbnail.startsWith('mc')) {
+    if (!anime.thumbnail) {
       setImgSrc('/assets/qiqi.png')
     } else {
       setImgSrc(anime.thumbnail)
@@ -19,8 +19,8 @@ export function AnimeBox({ anime }) {
     setAnimeId(anime._id)
     setAnimeName(anime.name)
     setAnimeImage(imgSrc)
-    setAnimeMaxEps(anime.episodeCount)
-    setAnimeEnded(anime.episodeCount == anime.lastEpisodeInfo.sub.episodeString)
+    setAnimeMaxEps(anime.subEpisodes)
+    setAnimeEnded(anime.ended)
     setPage('episodes')
   }
 
@@ -30,9 +30,9 @@ export function AnimeBox({ anime }) {
         <img className={styles.img} src={imgSrc} alt={anime.name} onClick={() => selectAnime()} />
         <div className={styles.overlay}>
           <span className={styles.episodes}>
-            {isMovie ? 'Movie' : `Ep ${anime.availableEpisodes.sub}`}
+            {isMovie ? 'Movie' : `Ep ${anime.subEpisodes}`}
           </span>
-          <span className={styles.score}>☆ {anime.score}</span>
+          <span className={styles.score}>{anime.type}</span>
         </div>
       </div>
       <div className={styles.title}>{anime.name}</div>

@@ -28,14 +28,11 @@ export function EpisodeSelector() {
   async function playAnime(episodeId) {
     const sources = await window.api.api_getAnimeVideo(animeId!, episodeId)
 
-    const best =
-      sources.find((s) => s.isM3U8) || // m3u8 priority
-      sources.find((s) => s.provider === 'S-mp4') || // fast internal mirrors
-      sources.find((s) => s.provider === 'Yt-mp4') || //dnld source
-      sources[0]
+    // hianime hands back the quality variants of one stream, best first
+    const best = sources[0]
 
     if (best?.sourceUrl) {
-      window.api.api_launchPlayer(best.sourceUrl)
+      window.api.api_launchPlayer(best)
     } else {
       console.log('source sucks')
     }
@@ -45,7 +42,8 @@ export function EpisodeSelector() {
     if (animeId) {
       async function a() {
         const data = await window.api.api_getAnimeEpisodeList(animeId!)
-        setAnimeEpisodes([...data].reverse())
+        // episode ids are strings ("1", "2", ..., "21"), sort numerically not lexically
+        setAnimeEpisodes([...data].sort((a: string, b: string) => Number(a) - Number(b)))
       }
       a()
     }

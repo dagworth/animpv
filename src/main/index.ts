@@ -1,7 +1,7 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { is } from '@electron-toolkit/utils'
-import { getEpisodesList, searchAnime, getEpisodeData } from './allanime'
+import { getEpisodesList, searchAnime, getEpisodeData, PlayableSource } from './hianime'
 import { spawn } from 'child_process'
 
 const iconPath = app.isPackaged 
@@ -59,18 +59,11 @@ app.whenReady().then(() => {
 
     return await getEpisodeData(a, b, logger)
   })
-  ipcMain.handle('launch-mpv', async (event, input) => {
+  ipcMain.handle('launch-mpv', async (event, source: PlayableSource) => {
     const webContents = event.sender
-    let videoUrl = input
-    let referrer = ''
-
-    if (videoUrl.includes('mp4upload.com')) {
-      referrer = 'https://www.mp4upload.com'
-    } else if (videoUrl.includes('sharepoint')) {
-      referrer = '' //they block any referrers
-    } else {
-      referrer = 'https://youtu-chan.com' //for ani-cli
-    }
+    const videoUrl = source.sourceUrl
+    //the stream host only serves the segments to the embed site it came from
+    const referrer = source.referrer ?? ''
 
     const mpv_args = [
       '--fs',
@@ -89,8 +82,13 @@ app.whenReady().then(() => {
       mpv_args.push(`--referrer=${referrer}`)
     }
 
+    //subtitles are a separate track now, toggle them in mpv with 'v'
+    if (source.subtitle) {
+      mpv_args.push(`--sub-file=${source.subtitle}`)
+    }
+
     mpv_args.push(
-      `--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36`
+      `--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36`
     )
 
     console.log(`Launching mpv with arguments: ${mpv_args.join(' ')} ${videoUrl}`)

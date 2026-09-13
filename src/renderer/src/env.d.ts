@@ -2,7 +2,7 @@ export interface IElectronAPI {
   api_searchAnime: (query: string) => Promise<any>
   api_getAnimeEpisodeList: (query: string) => Promise<any>
   api_getAnimeVideo: (a: string, b: string) => Promise<any>
-  api_launchPlayer: (a: string) => void
+  api_launchPlayer: (source: any) => void
   onLog: (callback: (log: string) => void) => () => void
 }
 

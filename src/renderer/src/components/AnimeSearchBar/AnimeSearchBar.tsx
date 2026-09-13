@@ -10,7 +10,9 @@ export default function AnimeSearchBar({ setResults }) {
     if (l) setQuery(l)
     if (lr) {
       try {
-        setResults(JSON.parse(lr))
+        const cached = JSON.parse(lr)
+        // allanime-shaped results carry no type, drop them instead of rendering blanks
+        setResults(cached.every((anime: any) => anime?.type) ? cached : [])
       } catch (e) {
         console.error('bad json')
       }

@@ -7,7 +7,51 @@ const AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
 const REFR = 'https://youtu-chan.com'
 
-const DECRYPT_KEY = crypto.createHash('sha256').update('Xot36i3lK3:v1').digest()
+// Fallback values from AllAnime's JS build — update when site rotates keys
+const FALLBACK_MASK = 'b1a9a4d051988f1b1b12dbb747439d9bd64b09ea17835600a7eaa4de87c1ad87'
+const FALLBACK_PART_B = 'k7DLdv5SGiuEyGUtcncl5wQOR7r4aenLfDV3AOBKlAU='
+const FALLBACK_EPOCH = 4128
+const FALLBACK_QUERY_HASH = 'd405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec'
+
+function deriveKey(maskHex: string, partB: string): Buffer {
+  const mask = Buffer.from(maskHex, 'hex')
+  const secret = Buffer.from(partB, 'base64')
+  return Buffer.from(mask.map((b, i) => b ^ secret[i]))
+}
+
+let _cryptoCache: { key: Buffer; epoch: number; queryHash: string; expiresAt: number } | null =
+  null
+
+async function fetchCrypto(): Promise<{ key: Buffer; epoch: number; queryHash: string }> {
+  if (_cryptoCache && _cryptoCache.expiresAt > Date.now()) {
+    return _cryptoCache
+  }
+  try {
+    const siteResp = await axios.get('https://allanime.day', {
+      headers: { 'User-Agent': AGENT },
+      timeout: 8000
+    })
+    const html: string = siteResp.data
+    const aaMatch = html.match(/window\.__aaCrypto\s*=\s*(\{.*?\})/)
+    if (!aaMatch) throw new Error('no __aaCrypto')
+    const aa = JSON.parse(aaMatch[1])
+    const key = deriveKey(FALLBACK_MASK, aa.partB ?? FALLBACK_PART_B)
+    const epoch: number = aa.epoch ?? FALLBACK_EPOCH
+    const queryHash = FALLBACK_QUERY_HASH
+    const expiresAt = Math.max(
+      (aa.switchAt ?? 0) + (aa.graceMs ?? 0),
+      Date.now() + 3_600_000
+    )
+    _cryptoCache = { key, epoch, queryHash, expiresAt }
+    return { key, epoch, queryHash }
+  } catch {
+    return {
+      key: deriveKey(FALLBACK_MASK, FALLBACK_PART_B),
+      epoch: FALLBACK_EPOCH,
+      queryHash: FALLBACK_QUERY_HASH
+    }
+  }
+}
 
 export interface PlayableSource {
   provider: string
@@ -17,20 +61,31 @@ export interface PlayableSource {
   referrer?: string
 }
 
-function decryptAES(ciphertextB64: string): string {
+function decryptAES(ciphertextB64: string, key: Buffer): string {
   try {
     const buffer = Buffer.from(ciphertextB64, 'base64')
-    const extractedIv = buffer.subarray(1, 13)
-    const ivHex = extractedIv.toString('hex') + '00000002'
-    const iv = Buffer.from(ivHex, 'hex')
+    const iv = buffer.subarray(1, 13)
+    const tag = buffer.subarray(buffer.length - 16)
     const ciphertext = buffer.subarray(13, buffer.length - 16)
-    const decipher = crypto.createDecipheriv('aes-256-ctr', DECRYPT_KEY, iv)
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv)
+    decipher.setAuthTag(tag)
     const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()])
     return decrypted.toString('utf8')
   } catch (e) {
-    console.error('AES Decryption failed:', e)
+    console.error('AES-GCM Decryption failed:', e)
     return ''
   }
+}
+
+function generateAaReq(key: Buffer, epoch: number, queryHash: string): string {
+  // ts truncated to 5-minute window in milliseconds, matching AllAnime's protocol
+  const ts = Math.floor(Date.now() / 300_000) * 300_000
+  const payload = JSON.stringify({ v: 1, ts, epoch, qh: queryHash })
+  const iv = crypto.createHash('sha256').update(`${epoch}:${queryHash}:${ts}`).digest().subarray(0, 12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  const encrypted = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return Buffer.concat([Buffer.from([0x01]), iv, encrypted, tag]).toString('base64')
 }
 
 function decodeXorUrl(hexUrl: string): string {
@@ -54,8 +109,12 @@ export async function getEpisodeData(
   const epStr = String(episodeString)
   const query_vars = JSON.stringify({ showId, translationType: 'sub', episodeString: epStr })
 
-  const query_hash = 'd405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec'
-  const query_ext = JSON.stringify({ persistedQuery: { version: 1, sha256Hash: query_hash } })
+  const { key, epoch, queryHash } = await fetchCrypto()
+  const aaReq = generateAaReq(key, epoch, queryHash)
+  const query_ext = JSON.stringify({
+    persistedQuery: { version: 1, sha256Hash: queryHash },
+    aaReq
+  })
 
   const headers = {
     'User-Agent': AGENT,
@@ -65,31 +124,14 @@ export async function getEpisodeData(
 
   let responseData: any = null
 
-  logger!(`trying GET request (presisted query)`)
+  logger!(`sending GET request with aaReq token`)
   try {
-    const apqUrl = `${ALLANIME_API}/api?variables=${encodeURIComponent(query_vars)}&extensions=${encodeURIComponent(query_ext)}`
+    const apqUrl = `${ALLANIME_API}?variables=${encodeURIComponent(query_vars)}&extensions=${encodeURIComponent(query_ext)}`
     const getResp = await axios.get(apqUrl, { headers })
     responseData = getResp.data
-  } catch (e) {}
-
-  logger!(`fallback on POST request`)
-  if (!responseData || !JSON.stringify(responseData).includes('tobeparsed')) {
-    try {
-      const fallbackQuery =
-        'query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode( showId: $showId translationType: $translationType episodeString: $episodeString ) { episodeString sourceUrls }}'
-      const postResp = await axios.post(
-        `${ALLANIME_API}/api`,
-        {
-          variables: { showId, translationType: 'sub', episodeString: epStr },
-          query: fallbackQuery
-        },
-        { headers }
-      )
-      responseData = postResp.data
-    } catch (e) {
-      logger!(`both get and post failed, plz tell me and also screenshot the logs`)
-      return []
-    }
+  } catch (e) {
+    logger!(`request failed, screenshot logs and report`)
+    return []
   }
 
   let targetPayload =
@@ -101,9 +143,8 @@ export async function getEpisodeData(
   if (Array.isArray(targetPayload)) {
     sources = targetPayload
   } else if (typeof targetPayload === 'string') {
-    const decrypted = decryptAES(targetPayload)
+    const decrypted = decryptAES(targetPayload, key)
     try {
-      // strip null bytes that might survive the decryption
       const cleanStr = decrypted.replace(/\0/g, '')
       const parsed = JSON.parse(cleanStr)
       sources =
@@ -128,7 +169,7 @@ export async function getEpisodeData(
     if (finalUrl.startsWith('--')) {
       finalUrl = decodeXorUrl(finalUrl)
     } else if (finalUrl.includes('tobeparsed=')) {
-      finalUrl = decryptAES(finalUrl.split('tobeparsed=')[1])
+      finalUrl = decryptAES(finalUrl.split('tobeparsed=')[1], key)
     }
 
     if (!finalUrl) continue

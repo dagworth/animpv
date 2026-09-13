@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
+import type { PlayableSource } from '../main/hianime'
 
 const api = {
   api_searchAnime: (query: string): Promise<string> =>
@@ -8,7 +9,7 @@ const api = {
     ipcRenderer.invoke('api-get-anime-episode-list', query),
   api_getAnimeVideo: (anime_id: string, episode_id: string): Promise<string> =>
     ipcRenderer.invoke('api-get-anime-video', anime_id, episode_id),
-  api_launchPlayer: (url: string) => ipcRenderer.invoke('launch-mpv', url),
+  api_launchPlayer: (source: PlayableSource) => ipcRenderer.invoke('launch-mpv', source),
   onLog: (callback: (log: string) => void) => {
     const subscription = (_event: any, value: string) => callback(value)
     ipcRenderer.on('mpv-log', subscription)
