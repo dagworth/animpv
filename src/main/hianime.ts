@@ -62,6 +62,36 @@ function deobfuscateBlob(blob: string): string {
   return decoded.toString('utf8')
 }
 
+function decodeHtmlEntities(text: string): string {
+  return text.replace(/&#039;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+}
+
+function parseSearchResultCard(card: string): AnimeResult | null {
+  const href = firstMatch(card, /<h3 class="film-name">\s*<a href="([^"]*)"/)
+  const name = firstMatch(card, /<h3 class="film-name">\s*<a[^>]*title="([^"]*)"/)
+  if (!href || !name) return null
+
+  // the slug carries the id hianime's episode api wants, e.g. "flcl-1286"
+  const id = href.replace(/\/$/, '').split('/').pop()
+  if (!id) return null
+
+  const subEpisodes = firstMatch(card, /tick-sub[^>]*>(?:<i[^>]*><\/i>)?\s*([0-9]+)/)
+  const dubEpisodes = firstMatch(card, /tick-dub[^>]*>(?:<i[^>]*><\/i>)?\s*([0-9]+)/)
+  // tick-eps is only rendered once a show has finished airing
+  const totalEpisodes = firstMatch(card, /tick-eps[^>]*>\s*([0-9]+)/)
+
+  return {
+    _id: id,
+    name: decodeHtmlEntities(name),
+    thumbnail: firstMatch(card, /<img src="([^"]*)"[^>]*class="film-poster-img"/) || '',
+    type: firstMatch(card, /<span class="fdi-item">([^<]*)</) || 'TV',
+    subEpisodes: Number(subEpisodes ?? 0),
+    dubEpisodes: Number(dubEpisodes ?? 0),
+    totalEpisodes: totalEpisodes === null ? null : Number(totalEpisodes),
+    ended: totalEpisodes !== null
+  }
+}
+
 export async function searchAnime(query: string): Promise<AnimeResult[]> {
   let page: string
   try {
@@ -73,38 +103,9 @@ export async function searchAnime(query: string): Promise<AnimeResult[]> {
 
   // the top 10 sidebar repeats the result markup, cut it off before parsing
   const body = page.split('id="main-sidebar"')[0]
-  const results: AnimeResult[] = []
+  const cards = body.split('class="flw-item').slice(1)
 
-  for (const item of body.split('class="flw-item').slice(1)) {
-    const href = firstMatch(item, /<h3 class="film-name">\s*<a href="([^"]*)"/)
-    const name = firstMatch(item, /<h3 class="film-name">\s*<a[^>]*title="([^"]*)"/)
-    if (!href || !name) continue
-
-    // the slug carries the id hianime's episode api wants, e.g. "flcl-1286"
-    const id = href.replace(/\/$/, '').split('/').pop()
-    if (!id) continue
-
-    const subEpisodes = firstMatch(item, /tick-sub[^>]*>(?:<i[^>]*><\/i>)?\s*([0-9]+)/)
-    const dubEpisodes = firstMatch(item, /tick-dub[^>]*>(?:<i[^>]*><\/i>)?\s*([0-9]+)/)
-    // tick-eps is only rendered once a show has finished airing
-    const totalEpisodes = firstMatch(item, /tick-eps[^>]*>\s*([0-9]+)/)
-
-    results.push({
-      _id: id,
-      name: name
-        .replace(/&#039;/g, "'")
-        .replace(/&quot;/g, '"')
-        .replace(/&amp;/g, '&'),
-      thumbnail: firstMatch(item, /<img src="([^"]*)"[^>]*class="film-poster-img"/) || '',
-      type: firstMatch(item, /<span class="fdi-item">([^<]*)</) || 'TV',
-      subEpisodes: Number(subEpisodes ?? 0),
-      dubEpisodes: Number(dubEpisodes ?? 0),
-      totalEpisodes: totalEpisodes === null ? null : Number(totalEpisodes),
-      ended: totalEpisodes !== null
-    })
-  }
-
-  return results
+  return cards.map(parseSearchResultCard).filter((result): result is AnimeResult => result !== null)
 }
 
 export async function getEpisodesList(animeId: string): Promise<string[] | null> {
@@ -148,6 +149,70 @@ async function resolveEpisodeId(animeId: string, episode: string): Promise<strin
   return _episodeMaps.get(animeId)?.get(episode)
 }
 
+async function fetchEmbedHash(episodeId: string, mode: 'sub' | 'dub'): Promise<string | null> {
+  const servers: string = (await hianimeGet(`${SERVERS_API}${episodeId}`, HIANIME_BASE))?.html
+  return firstMatch(
+    servers ?? '',
+    new RegExp(`data-type="${mode}"\\s*data-server-name="${EMBED_SERVER}"\\s*data-hash="([^"]*)"`)
+  )
+}
+
+async function fetchPlayerConfig(embedUrl: string): Promise<{ src?: string; subtitles?: any[] }> {
+  const embedPage: string = await hianimeGet(embedUrl, HIANIME_BASE)
+  const blob = firstMatch(embedPage, /window\.__P="([^"]*)"/)
+  if (!blob) throw new Error('no window.__P')
+  return JSON.parse(deobfuscateBlob(blob))
+}
+
+// several languages can be listed, the site marks the english track as default
+function pickSubtitle(subtitles: any[] | undefined): string | undefined {
+  const list = Array.isArray(subtitles) ? subtitles : []
+  return (list.find((s) => s.default) ?? list[0])?.src
+}
+
+function buildPlayableSources(
+  playlist: string,
+  master: string,
+  referrer: string,
+  subtitle: string | undefined
+): PlayableSource[] {
+  const sources: PlayableSource[] = []
+  const lines = playlist.split('\n').map((line) => line.trim())
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue
+    const variant = lines.slice(i + 1).find((line) => line && !line.startsWith('#'))
+    if (!variant) continue
+
+    const height = firstMatch(lines[i], /RESOLUTION=[0-9]+x([0-9]+)/)
+    sources.push({
+      provider: EMBED_SERVER,
+      quality: height ? `${height}p` : 'Auto',
+      // quality variants are relative to the master playlist
+      sourceUrl: /^https?:\/\//.test(variant)
+        ? variant
+        : `${master.slice(0, master.lastIndexOf('/'))}/${variant}`,
+      isM3U8: true,
+      referrer,
+      subtitle
+    })
+  }
+
+  const resolution = (source: PlayableSource): number => parseInt(source.quality) || 0
+  sources.sort((a, b) => resolution(b) - resolution(a))
+
+  sources.push({
+    provider: EMBED_SERVER,
+    quality: 'Adaptive/Stream',
+    sourceUrl: master,
+    isM3U8: true,
+    referrer,
+    subtitle
+  })
+
+  return sources
+}
+
 export async function getEpisodeData(
   animeId: string,
   episodeString: string | number,
@@ -164,19 +229,14 @@ export async function getEpisodeData(
     return []
   }
 
-  let servers: string
+  let hash: string | null
   try {
     log(`fetching ${mode} servers for episode id ${episodeId}`)
-    servers = (await hianimeGet(`${SERVERS_API}${episodeId}`, HIANIME_BASE))?.html
+    hash = await fetchEmbedHash(episodeId, mode)
   } catch {
     log(`request failed, screenshot logs and report`)
     return []
   }
-
-  const hash = firstMatch(
-    servers ?? '',
-    new RegExp(`data-type="${mode}"\\s*data-server-name="${EMBED_SERVER}"\\s*data-hash="([^"]*)"`)
-  )
   if (!hash) {
     log(`no ${EMBED_SERVER} embed listed for ${mode}`)
     return []
@@ -186,27 +246,21 @@ export async function getEpisodeData(
   // the stream host only serves the segments to the embed site
   const referrer = embedUrl.replace(/^(https?:\/\/[^/]*).*/, '$1/')
 
-  let config: any
+  let config: { src?: string; subtitles?: any[] }
   try {
     log(`reading player config from ${embedUrl}`)
-    const embedPage: string = await hianimeGet(embedUrl, HIANIME_BASE)
-    const blob = firstMatch(embedPage, /window\.__P="([^"]*)"/)
-    if (!blob) throw new Error('no window.__P')
-    config = JSON.parse(deobfuscateBlob(blob))
+    config = await fetchPlayerConfig(embedUrl)
   } catch {
     log(`failed parsing embed config, probably also screenshot and send to me`)
     return []
   }
 
-  const master: string | undefined = config?.src
+  const master = config.src
   if (!master) {
     log(`no stream in player config`)
     return []
   }
-
-  // several languages can be listed, the site marks the english track as default
-  const subtitles: any[] = Array.isArray(config.subtitles) ? config.subtitles : []
-  const subtitle: string | undefined = (subtitles.find((s) => s.default) ?? subtitles[0])?.src
+  const subtitle = pickSubtitle(config.subtitles)
 
   let playlist: string
   try {
@@ -216,41 +270,7 @@ export async function getEpisodeData(
     return []
   }
 
-  const playableSources: PlayableSource[] = []
-  const lines = playlist.split('\n').map((line) => line.trim())
-
-  for (let i = 0; i < lines.length; i++) {
-    if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue
-    const variant = lines.slice(i + 1).find((line) => line && !line.startsWith('#'))
-    if (!variant) continue
-
-    const height = firstMatch(lines[i], /RESOLUTION=[0-9]+x([0-9]+)/)
-    playableSources.push({
-      provider: EMBED_SERVER,
-      quality: height ? `${height}p` : 'Auto',
-      // quality variants are relative to the master playlist
-      sourceUrl: /^https?:\/\//.test(variant)
-        ? variant
-        : `${master.slice(0, master.lastIndexOf('/'))}/${variant}`,
-      isM3U8: true,
-      referrer,
-      subtitle
-    })
-  }
-
-  const resolution = (source: PlayableSource): number => parseInt(source.quality) || 0
-  playableSources.sort((a, b) => resolution(b) - resolution(a))
-
-  // the master playlist itself lets the player do the switching
-  playableSources.push({
-    provider: EMBED_SERVER,
-    quality: 'Adaptive/Stream',
-    sourceUrl: master,
-    isM3U8: true,
-    referrer,
-    subtitle
-  })
-
+  const playableSources = buildPlayableSources(playlist, master, referrer, subtitle)
   log(`got ${playableSources.length} sources`)
   return playableSources
 }

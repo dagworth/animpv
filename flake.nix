@@ -1,6 +1,4 @@
 {
-  description = "Dev environment for animpv (Electron app that scrapes anime and drives mpv)";
-
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
   };
