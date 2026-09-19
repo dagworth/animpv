@@ -4,8 +4,8 @@ import { is } from '@electron-toolkit/utils'
 import { getEpisodesList, searchAnime, getEpisodeData, PlayableSource } from './hianime'
 import { spawn } from 'child_process'
 
-const iconPath = app.isPackaged 
-  ? join(process.resourcesPath, 'icon.ico') 
+const iconPath = app.isPackaged
+  ? join(process.resourcesPath, 'icon.ico')
   : join(__dirname, '../../resources/icon.ico')
 
 function createWindow(): void {
